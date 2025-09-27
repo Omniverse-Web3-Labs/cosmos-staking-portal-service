@@ -1,0 +1,741 @@
+package service
+
+import (
+	"app/internal/cache/redisclient"
+	"app/internal/config"
+	"app/internal/model"
+	"app/pkg/utils"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/big"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/shurcooL/graphql"
+)
+
+var ChainDataService chainDataService
+
+type BigIntFromString struct {
+	*big.Int
+}
+
+func (b *BigIntFromString) UnmarshalJSON(data []byte) error {
+	str := strings.Trim(string(data), "\"") // 去掉引号
+	bInt := new(big.Int)
+	bInt, success := bInt.SetString(str, 10)
+	if !success {
+		return fmt.Errorf("invalid big integer string: %s", str)
+	}
+	b.Int = bInt
+	return nil
+}
+
+func (b BigIntFromString) MarshalJSON() ([]byte, error) {
+	return json.Marshal(b.String())
+}
+
+type BigFloatFromString struct {
+	*big.Float
+}
+
+func (b *BigFloatFromString) UnmarshalJSON(data []byte) error {
+	str := strings.Trim(string(data), "\"")
+	bigFloat := new(big.Float)
+
+	_, success := bigFloat.SetString(str)
+	if !success {
+		return fmt.Errorf("invalid big float string: %s", str)
+	}
+
+	b.Float = bigFloat
+	return nil
+}
+
+type Float64FromString float64
+
+func (f *Float64FromString) UnmarshalJSON(data []byte) error {
+	str := string(data)
+	str = str[1 : len(str)-1] // 去掉引号
+	val, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		return err
+	}
+	*f = Float64FromString(val)
+	return nil
+}
+
+func (f Float64FromString) MarshalJSON() ([]byte, error) {
+	return json.Marshal(strconv.FormatFloat(float64(f), 'f', -1, 64))
+}
+
+type Int64FromString int64
+
+func (f *Int64FromString) UnmarshalJSON(data []byte) error {
+	str := string(data)
+	str = str[1 : len(str)-1] // 去掉引号
+	val, err := strconv.ParseInt(str, 10, 64)
+	if err != nil {
+		return err
+	}
+	*f = Int64FromString(val)
+	return nil
+}
+
+func (i Int64FromString) MarshalJSON() ([]byte, error) {
+	return json.Marshal(strconv.FormatInt(int64(i), 10))
+}
+
+type RawDelegation struct {
+	Delegation []RawDelegator `json:"delegation_responses"`
+	Pagination RawPagination  `json:"pagination"`
+}
+
+type RawUnbondingDelegator struct {
+	DelegatorAddress string `json:"delegator_address"`
+	ValidatorAddress string `json:"validator_address"`
+	Entries          []struct {
+		CreationHeight          Int64FromString  `json:"creation_height"`
+		CompletionTime          time.Time        `json:"completion_time"`
+		InitialBalance          BigIntFromString `json:"initial_balance"`
+		Balance                 BigIntFromString `json:"balance"`
+		UnbondingID             Int64FromString  `json:"unbonding_id"`
+		UnbondingOnHoldRefCount Int64FromString  `json:"unbonding_on_hold_ref_count"`
+	} `json:"entries"`
+}
+
+type RawUnbondingDelegation struct {
+	Unbondings []RawUnbondingDelegator `json:"unbonding_responses"`
+	Pagination RawPagination           `json:"pagination"`
+}
+
+type RawDelegator struct {
+	Delegation struct {
+		DelegatorAddress string             `json:"delegator_address"`
+		ValidatorAddress string             `json:"validator_address"`
+		Shares           BigFloatFromString `json:"shares"`
+	} `json:"delegation"`
+	Balance struct {
+		Denom  string           `json:"denom"`
+		Amount BigIntFromString `json:"amount"`
+	} `json:"balance"`
+}
+
+type RawValidators struct {
+	Validators []RawValidator `json:"validators"`
+	Pagination RawPagination  `json:"pagination"`
+}
+
+type RawSingleValidator struct {
+	SingleValidator RawValidator `json:"validator"`
+}
+
+type RawPagination struct {
+	NextKey string          `json:"next_key"`
+	Total   Int64FromString `json:"total"`
+}
+
+type RawPool struct {
+	PoolData struct {
+		NotBondedTokens BigIntFromString `json:"not_bonded_tokens"`
+		BondedTokens    BigIntFromString `json:"bonded_tokens"`
+	} `json:"pool"`
+}
+
+type RawSupply struct {
+	Supply []RawSingleSupply `json:"supply"`
+}
+
+type RawSingleSupply struct {
+	Denom  string           `json:"denom"`
+	Amount BigIntFromString `json:"amount"`
+}
+
+type RawInflation struct {
+	Inflation Float64FromString `json:"inflation"`
+}
+
+type RawValidator struct {
+	OperatorAddress string             `json:"operator_address"`
+	Jailed          bool               `json:"jailed"`
+	Status          string             `json:"status"`
+	Tokens          BigIntFromString   `json:"tokens"`
+	DelegatorShares BigFloatFromString `json:"delegator_shares"`
+	Description     struct {
+		Moniker          string `json:"moniker"`
+		Identity         string `json:"identity"`
+		Website          string `json:"website"`
+		SecurityContract string `json:"security_contact"`
+		Details          string `json:"details"`
+	} `json:"description"`
+	Commission struct {
+		CommissionRates struct {
+			Rate          Float64FromString `json:"rate"`
+			MaxRate       Float64FromString `json:"max_rate"`
+			MaxChangeRate Float64FromString `json:"max_change_rate"`
+		} `json:"commission_rates"`
+		UpdateTime time.Time `json:"update_time"`
+	} `json:"commission"`
+	UnbondingHeight   Int64FromString `json:"unbonding_height"`
+	UnbondingTime     time.Time       `json:"unbonding_time"`
+	MinSelfDelegation Int64FromString `json:"min_self_delegation"`
+}
+
+type RawBlock struct {
+	Block struct {
+		Header struct {
+			Height Int64FromString `json:"height"`
+			Time   time.Time       `json:"time"`
+		} `json:"header"`
+	} `json:"block"`
+}
+
+type chainDataService struct {
+}
+
+func sendRequest(url string, method string, headers *map[string]string, body io.Reader) ([]byte, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if headers != nil {
+		for key, value := range *headers {
+			req.Header.Add(key, value)
+		}
+	}
+	// req.Header.Add("Content-Type", "application/json")
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return nil, fmt.Errorf("HTTP request failed with status: %s", resp.Status)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/validators
+func (service *chainDataService) GetValidators(ctx context.Context) ([]RawValidator, error) {
+	data, err := redisclient.RedisClient.HGet(ctx, redisclient.KeyRawValidators, "raw_list").Bytes()
+	if err != nil {
+		fmt.Printf("redis get %s error %s\n", redisclient.KeyRawValidators, err.Error())
+	}
+
+	var validators RawValidators
+
+	if data == nil {
+		// get lock
+		setnx, err := redisclient.RedisClient.SetNX(ctx, redisclient.KeyValidatorsLock, 1, redisclient.RPCSetNux).Result()
+
+		if err != nil {
+			fmt.Println("Redis set nx validator list error", err.Error())
+		} else if setnx {
+			url := fmt.Sprintf("%scosmos/staking/v1beta1/validators", config.GetConfig().Endpoint.Rest)
+
+			data, err = sendRequest(url, "GET", nil, nil)
+
+			if err != nil {
+				return nil, err
+			}
+
+			err = json.Unmarshal(data, &validators)
+			if err != nil {
+				return nil, err
+			}
+
+			pipe := redisclient.RedisClient.TxPipeline()
+			pipe.HSet(ctx, redisclient.KeyRawValidators, "raw_list", data)
+			for _, v := range validators.Validators {
+				vData, err := json.Marshal(v)
+				if err != nil {
+					fmt.Println("validator data marshal failed", err.Error())
+					continue
+				}
+				pipe.HSet(ctx, redisclient.KeyRawValidators, v.OperatorAddress, vData)
+			}
+			pipe.Expire(ctx, redisclient.KeyRawValidators, redisclient.RawValidatorsTTL)
+			_, err = pipe.Exec(ctx)
+			if err != nil {
+				fmt.Println("Redis Get Validators pipe exec failed", err.Error())
+			}
+			redisclient.RedisClient.Del(ctx, redisclient.KeyValidatorsLock)
+		} else {
+			checkInterval := 100 * time.Millisecond // 0.1秒
+			totalTime := redisclient.RPCSetNux * time.Second
+
+			ticker := time.NewTicker(checkInterval)
+			defer ticker.Stop()
+
+			timeout := time.After(totalTime)
+
+		outer:
+			for {
+				select {
+				case <-ticker.C:
+					data, err = redisclient.RedisClient.HGet(ctx, redisclient.KeyRawValidators, "raw_list").Bytes()
+					if err != nil {
+						fmt.Printf("redis get %s error %s\n", redisclient.KeyRawValidators, err.Error())
+					}
+
+					if data != nil {
+						break outer
+					}
+				case <-timeout:
+					return nil, fmt.Errorf("get raw validators timeout")
+				}
+			}
+		}
+	} else {
+		err = json.Unmarshal(data, &validators)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return validators.Validators, nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/validator/ethmvaloper1clnaafa38d785mstfw9c29hxwg0tdjmjmuw07v
+func (service *chainDataService) GetValidator(ctx context.Context, validatorAddress string) (*RawValidator, error) {
+	data, err := redisclient.RedisClient.HGet(ctx, redisclient.KeyRawValidators, validatorAddress).Bytes()
+	if err != nil {
+		fmt.Printf("redis get %s:%s error %s\n", redisclient.KeyRawValidators, validatorAddress, err.Error())
+	}
+
+	var validator RawValidator
+	if data == nil {
+		url := fmt.Sprintf("%scosmos/staking/v1beta1/validators/%s", config.GetConfig().Endpoint.Rest, validatorAddress)
+
+		data, err := sendRequest(url, "GET", nil, nil)
+
+		if err != nil {
+			return nil, err
+		}
+
+		var singleValidator RawSingleValidator
+		err = json.Unmarshal(data, &singleValidator)
+		if err != nil {
+			return nil, err
+		}
+
+		validator = singleValidator.SingleValidator
+		data, err = json.Marshal(singleValidator.SingleValidator)
+
+		if err != nil {
+			fmt.Println("get validator json marshal err", err.Error())
+		} else {
+			// get lock
+			setnx, err := redisclient.RedisClient.SetNX(ctx, redisclient.KeyValidatorsLock, 1, redisclient.RPCSetNux).Result()
+			if err != nil {
+				fmt.Println("Redis set nx validator error", validatorAddress, err.Error())
+			} else if setnx {
+				err := redisclient.RedisClient.HSet(ctx, redisclient.KeyRawValidators, validatorAddress, data).Err()
+				if err != nil {
+					fmt.Println("Redis set validator error", err.Error())
+				}
+				redisclient.RedisClient.Del(ctx, redisclient.KeyValidatorsLock)
+			}
+		}
+	} else {
+		err = json.Unmarshal(data, &validator)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &validator, nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/validators/ethmvaloper1clnaafa38d785mstfw9c29hxwg0tdjmjmuw07v/delegations
+func (service *chainDataService) GetDelegators(ctx context.Context, validator string, key string, offset int, limit int, desc bool) ([]RawDelegator, error) {
+	redisKey := fmt.Sprintf(redisclient.KeyRawDelegation, validator, key, offset, limit, desc)
+	data, err := redisclient.RedisClient.Get(ctx, redisKey).Bytes()
+	if err != nil {
+		fmt.Printf("redis get %s error %s\n", redisKey, err.Error())
+	}
+
+	if data == nil {
+		url := fmt.Sprintf("%scosmos/staking/v1beta1/validators/%s/delegations?key=%s&offset=%d&limit=%d&reverse=%t",
+			config.GetConfig().Endpoint.Rest, validator, key, offset, limit, desc)
+
+		data, err = sendRequest(url, "GET", nil, nil)
+
+		if err != nil {
+			return nil, err
+		}
+
+		// get lock
+		redisLockKey := fmt.Sprintf(redisclient.KeyDelegationLock, validator, key, offset, limit, desc)
+		setnx, err := redisclient.RedisClient.SetNX(ctx, redisLockKey, 1, redisclient.RPCSetNux).Result()
+		if err != nil {
+			fmt.Println("Redis set nx pool error", err.Error())
+		} else if setnx {
+			err := redisclient.RedisClient.Set(ctx, redisKey, data, redisclient.RawDelegation).Err()
+			if err != nil {
+				fmt.Println("Redis set pool error", err.Error())
+			}
+			redisclient.RedisClient.Del(ctx, redisLockKey)
+		}
+	}
+
+	var delegation RawDelegation
+	err = json.Unmarshal(data, &delegation)
+	if err != nil {
+		return nil, err
+	}
+
+	return delegation.Delegation, nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/delegators/ethmvaloper1clnaafa38d785mstfw9c29hxwg0tdjmjmuw07v/unbonding_delegations
+func (service *chainDataService) GetUnbondingDelegations(delegator string) ([]RawUnbondingDelegator, error) {
+	// add cache here
+	url := fmt.Sprintf("%scosmos/staking/v1beta1/delegators/%s/unbonding_delegations", config.GetConfig().Endpoint.Rest, delegator)
+
+	data, err := sendRequest(url, "GET", nil, nil)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var unbondingDelegation RawUnbondingDelegation
+	err = json.Unmarshal(data, &unbondingDelegation)
+	if err != nil {
+		return nil, err
+	}
+
+	return unbondingDelegation.Unbondings, nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/delegations/ethmvaloper1clnaafa38d785mstfw9c29hxwg0tdjmjmuw07v
+func (service *chainDataService) GetDelegations(delegator string) ([]RawDelegator, error) {
+	// add cache here
+	url := fmt.Sprintf("%scosmos/staking/v1beta1/delegations/%s", config.GetConfig().Endpoint.Rest, delegator)
+
+	data, err := sendRequest(url, "GET", nil, nil)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var delegation RawDelegation
+	err = json.Unmarshal(data, &delegation)
+	if err != nil {
+		return nil, err
+	}
+
+	return delegation.Delegation, nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/pool
+func (service *chainDataService) GetPool(ctx context.Context) (*RawPool, error) {
+	data, err := redisclient.RedisClient.Get(ctx, redisclient.KeyRawPool).Bytes()
+	if err != nil {
+		fmt.Println("GetPool error", err.Error())
+	}
+
+	if data == nil {
+		url := fmt.Sprintf("%scosmos/staking/v1beta1/pool", config.GetConfig().Endpoint.Rest)
+
+		data, err = sendRequest(url, "GET", nil, nil)
+
+		if err != nil {
+			return nil, err
+		}
+
+		// get lock
+		setnx, err := redisclient.RedisClient.SetNX(ctx, redisclient.KeyPoolLock, 1, redisclient.RPCSetNux).Result()
+		if err != nil {
+			fmt.Println("Redis set nx pool error", err.Error())
+		} else if setnx {
+			err := redisclient.RedisClient.Set(ctx, redisclient.KeyRawPool, data, redisclient.RawPoolTTL).Err()
+			if err != nil {
+				fmt.Println("Redis set pool error", err.Error())
+			}
+			redisclient.RedisClient.Del(ctx, redisclient.KeyPoolLock)
+		}
+	}
+
+	var pool RawPool
+	err = json.Unmarshal(data, &pool)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pool, nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/pool
+func (service *chainDataService) GetTotalSupply(ctx context.Context) (*RawSingleSupply, error) {
+	data, err := redisclient.RedisClient.Get(ctx, redisclient.KeyRawSupply).Bytes()
+	if err != nil {
+		fmt.Println("GetTotalSupply error", err.Error())
+	}
+
+	if data == nil {
+		url := fmt.Sprintf("%scosmos/bank/v1beta1/supply", config.GetConfig().Endpoint.Rest)
+
+		data, err = sendRequest(url, "GET", nil, nil)
+
+		if err != nil {
+			return nil, err
+		}
+
+		// get lock
+		setnx, err := redisclient.RedisClient.SetNX(ctx, redisclient.KeySupplyLock, 1, redisclient.RPCSetNux).Result()
+		if err != nil {
+			fmt.Println("Redis set nx supply error", err.Error())
+		} else if setnx {
+			err := redisclient.RedisClient.Set(ctx, redisclient.KeyRawSupply, data, redisclient.RawSupplyTTL).Err()
+			if err != nil {
+				fmt.Println("Redis set supply error", err.Error())
+			}
+			redisclient.RedisClient.Del(ctx, redisclient.KeySupplyLock)
+		}
+	}
+
+	var supply RawSupply
+	err = json.Unmarshal(data, &supply)
+	if err != nil {
+		return nil, err
+	}
+
+	return &supply.Supply[0], nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/pool
+func (service *chainDataService) GetInflation(ctx context.Context) (float64, error) {
+	data, err := redisclient.RedisClient.Get(ctx, redisclient.KeyRawInflation).Bytes()
+	if err != nil {
+		fmt.Println("GetInflation error", err.Error())
+	}
+
+	if data == nil {
+		url := fmt.Sprintf("%scosmos/mint/v1beta1/inflation", config.GetConfig().Endpoint.Rest)
+
+		data, err = sendRequest(url, "GET", nil, nil)
+
+		if err != nil {
+			return 0, err
+		}
+
+		// get lock
+		setnx, err := redisclient.RedisClient.SetNX(ctx, redisclient.KeyInflationLock, 1, redisclient.RPCSetNux).Result()
+		if err != nil {
+			fmt.Println("Redis set nx inflation error", err.Error())
+		} else if setnx {
+			err := redisclient.RedisClient.Set(ctx, redisclient.KeyRawInflation, data, redisclient.RawInflationTTL).Err()
+			if err != nil {
+				fmt.Println("Redis set inflation error", err.Error())
+			}
+			redisclient.RedisClient.Del(ctx, redisclient.KeyInflationLock)
+		}
+	}
+
+	var inflation RawInflation
+	err = json.Unmarshal(data, &inflation)
+	if err != nil {
+		return 0, err
+	}
+
+	return float64(inflation.Inflation), nil
+}
+
+// real-time data
+// curl http://localhost:1317/cosmos/staking/v1beta1/pool
+func (service *chainDataService) GetBlock(height int64) (*RawBlock, error) {
+	// add cache here
+	url := fmt.Sprintf("%scosmos/base/tendermint/v1beta1/blocks/%d", config.GetConfig().Endpoint.Rest, height)
+
+	data, err := sendRequest(url, "GET", nil, nil)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var block RawBlock
+	err = json.Unmarshal(data, &block)
+	if err != nil {
+		return nil, err
+	}
+
+	return &block, nil
+}
+
+type ValidatorEventsOrderBy string
+type ValidatorEventFilter map[string]any
+type PowerEventFilter map[string]any
+type PowerEventsOrderBy string
+
+// historical data
+func (service *chainDataService) GetValidatorEvents(ctx context.Context, params *model.ValidatorEventQuery) (*utils.Paginator, error) {
+	page := utils.NewPaginator(params.Current, params.Size)
+	order := "desc"
+	if params.Order == "asc" {
+		order = "asc"
+	}
+	sort := "block_height"
+	if params.Sort != "" {
+		sort = params.Sort
+	}
+
+	orderBy := strings.ToUpper(fmt.Sprintf("%s_%s", sort, order))
+	client := graphql.NewClient(config.GetConfig().Endpoint.Graph, nil)
+	var query struct {
+		ValidatorEvents struct {
+			Nodes []struct {
+				ID                 graphql.ID
+				Validator          graphql.String
+				TxHash             graphql.String
+				BlockHeight        graphql.Int
+				EventType          graphql.String
+				PrevCommissionRate graphql.Float
+				CommissionRate     graphql.Float
+				Timestamp          graphql.String
+			}
+			PageInfo struct {
+				HasNextPage graphql.Boolean
+			}
+		} `graphql:"validatorEvents(orderBy: $orderBy, offset: $offset, first: $limit, filter: $filter)"`
+	}
+	var blockHeight = map[string]any{
+		"greaterThan": graphql.Int(0),
+	}
+	var filter ValidatorEventFilter = map[string]any{
+		"blockHeight": blockHeight,
+	}
+	if params.Validator != "" {
+		filter["validator"] = map[string]any{
+			"equalTo": params.Validator,
+		}
+	}
+	variables := map[string]interface{}{
+		"orderBy": []ValidatorEventsOrderBy{ValidatorEventsOrderBy(orderBy)},
+		"offset":  graphql.Int(page.Offset()),
+		"limit":   graphql.Int(page.Limit()),
+		"filter":  filter,
+	}
+	err := client.Query(ctx, &query, variables)
+	if err != nil {
+		return nil, err
+	}
+	page.SetHasMore(bool(query.ValidatorEvents.PageInfo.HasNextPage))
+	events := make([]model.ValidatorEvent, len(query.ValidatorEvents.Nodes))
+	now := time.Now().UnixMilli()
+	for i, node := range query.ValidatorEvents.Nodes {
+		timestamp, _ := strconv.ParseInt(string(node.Timestamp), 10, 64)
+		age := now - timestamp
+		events[i] = model.ValidatorEvent{
+			ID:                 fmt.Sprintf("%s", node.ID),
+			Validator:          string(node.Validator),
+			TxHash:             string(node.TxHash),
+			BlockHeight:        int(node.BlockHeight),
+			EventType:          string(node.EventType),
+			PrevCommissionRate: float64(node.PrevCommissionRate),
+			CommissionRate:     float64(node.CommissionRate),
+			Timestamp:          timestamp,
+			Age:                age,
+		}
+	}
+	page.SetList(events)
+	return page, nil
+}
+
+// historical data
+func (service *chainDataService) GetPowerEvents(ctx context.Context, params *model.PowerEventQuery) (*utils.Paginator, error) {
+	page := utils.NewPaginator(params.Current, params.Size)
+	order := "desc"
+	if params.Order == "asc" {
+		order = "asc"
+	}
+	sort := "block_height"
+	if params.Sort != "" {
+		sort = params.Sort
+	}
+
+	orderBy := strings.ToUpper(fmt.Sprintf("%s_%s", sort, order))
+	fmt.Println(orderBy)
+	client := graphql.NewClient(config.GetConfig().Endpoint.Graph, nil)
+	var query struct {
+		PowerEvents struct {
+			Nodes []struct {
+				ID          graphql.ID
+				BlockHeight graphql.Int
+				TxHash      graphql.String
+				Validator   graphql.String
+				Delegator   graphql.String
+				Amount      graphql.Float
+				EventType   graphql.String
+				Timestamp   graphql.String
+			}
+			PageInfo struct {
+				HasNextPage graphql.Boolean
+			}
+		} `graphql:"powerEvents(orderBy: $orderBy, offset: $offset, first: $limit, filter: $filter)"`
+	}
+	var blockHeight = map[string]any{
+		"greaterThan": graphql.Int(0),
+	}
+	var filter PowerEventFilter = map[string]any{
+		"blockHeight": blockHeight,
+	}
+	if params.Validator != "" {
+		filter["validator"] = map[string]any{
+			"equalTo": params.Validator,
+		}
+	}
+	if params.Delegator != "" {
+		filter["delegator"] = map[string]any{
+			"equalTo": params.Delegator,
+		}
+	}
+	variables := map[string]interface{}{
+		"orderBy": []PowerEventsOrderBy{PowerEventsOrderBy(orderBy)},
+		"offset":  graphql.Int(page.Offset()),
+		"limit":   graphql.Int(page.Limit()),
+		"filter":  filter,
+	}
+	err := client.Query(ctx, &query, variables)
+	if err != nil {
+		return nil, err
+	}
+	page.SetHasMore(bool(query.PowerEvents.PageInfo.HasNextPage))
+	events := make([]model.PowerEvent, len(query.PowerEvents.Nodes))
+	now := time.Now().UnixMilli()
+	for i, node := range query.PowerEvents.Nodes {
+		timestamp, _ := strconv.ParseInt(string(node.Timestamp), 10, 64)
+		age := now - int64(timestamp)
+		events[i] = model.PowerEvent{
+			ID:          fmt.Sprintf("%s", node.ID),
+			BlockHeight: int(node.BlockHeight),
+			TxHash:      string(node.TxHash),
+			Validator:   string(node.Validator),
+			Delegator:   string(node.Delegator),
+			Amount:      float64(node.Amount),
+			EventType:   string(node.EventType),
+			Timestamp:   timestamp,
+			Age:         age,
+		}
+	}
+	page.SetList(events)
+	return page, nil
+}

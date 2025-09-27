@@ -1,0 +1,48 @@
+serverApi:
+  name: omniverse
+  mode: debug
+  listen: :8080
+  jwtKey: tokenDecode
+  jwtAccessTokenExpireTime: 30000
+  jwtRefreshTokenExpireTime: 31536000
+
+databases:
+  postgres:
+    default:
+      host: <HOST>
+      port: 5432
+      dbname: postgres
+      username: postgres
+      password: <PASSWORD>
+    subquery:
+      host: <HOST>
+      port: 5432
+      dbname: subquery
+      username: postgres
+      password: <PASSWORD>
+
+otel:
+  trace:
+    serviceName: omni-api
+    exporterType: console
+    exporterEndpoint: 
+  log:
+    serviceName: omni-api
+    exporterType: console
+    exporterEndpoint: 
+  metric:
+    serviceName: omni-api
+    exporterType: console
+    exporterEndpoint: 
+
+endpoint:
+  rest: http://<IP>:1317/
+  grpc:
+  cometbft:
+  graph: http://<IP>:3000
+
+redis:
+  endpoint: localhost:6379
+  user: default
+  password: 
+  tls: false

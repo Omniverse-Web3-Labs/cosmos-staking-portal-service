@@ -1,0 +1,25 @@
+#!/bin/bash
+
+if [ -z $WORK_DIR ];then
+    DIR=$(dirname "$0")
+    WORK_DIR=$DIR/..
+    export WORK_DIR=$(cd $WORK_DIR && pwd)
+fi
+
+if [ -n $1 ];then
+    export APPLICATION=$1
+fi
+
+if [ -z $APPLICATION ];then
+    export APPLICATION=api
+fi
+
+if [ -z $MODE ];then
+    export MODE=release
+fi
+
+if [ -z $OUTPUT_DIR ];then
+    export OUTPUT_DIR="bin/${MODE}/${APPLICATION}"
+fi
+
+cd $WORK_DIR
